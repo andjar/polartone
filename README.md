@@ -6,9 +6,13 @@ Audio visualizer, rendering waveforms in polar coordinates. Uses WebAudio and Ca
 
 ## Online Demo
 
-The demo uses WebAudio, and only works in latest Chrome and FireFox.
-
 http://mattdesl.github.io/polartone/
+
+Drop an audio file on the page (or pick one), or use your microphone. The original demo streamed tracks from SoundCloud, but SoundCloud's public API has since been shut down, so the visualizer now takes local files, live mic input, or a direct audio URL.
+
+Keys: <kbd>space</kbd> pause/resume, <kbd>esc</kbd> menu, <kbd>s</kbd> save the canvas as PNG.
+
+Query parameters tweak the look, e.g. `?preset=1&alpha=0.1&extent=0.5&position=0,-3.5,0`. A direct, CORS-enabled audio link can be passed as `?url=https://example.com/song.mp3`.
 
 ## Screenshots
 
@@ -24,14 +28,14 @@ git clone https://github.com/mattdesl/polartone.git
 cd polartone
 npm install
 
-# start localhost:9966
-npm run start
+# start localhost:9966 with rebuild on change
+npm start
 
-# or run build process
+# or produce a minified bundle.js
 npm run build
 ```
 
-Tested on node 0.12.7 and npm 2.1.8.
+Requires Node 18+. Bundled with [esbuild](https://esbuild.github.io/).
 
 ## High-Resolution Prints
 
