@@ -1,13 +1,13 @@
 const Analyser = require('web-audio-analyser')
-const createCamera = require('perspective-camera')
 const createLoop = require('raf-loop')
 const getContext = require('get-canvas-context')
-const lerp = require('lerp')
 const once = require('once')
 const defined = require('defined')
 const fit = require('canvas-fit')
 const presets = require('./presets')
 const createUI = require('./lib/ui')
+const createSpiral = require('./lib/spiral')
+const videoExport = require('./lib/export')
 
 const FEATURES = ['distance', 'capacity', 'alpha', 'seek', 'extent', 'duration']
 const LIVE_DURATION = 180 // seconds for one full spiral when using the microphone
@@ -31,8 +31,13 @@ let current = null // { audio?, stream?, node, opt }
 const ui = createUI({
   onFile: (file) => play({ file }),
   onUrl: () => play({ url: query.get('url') }),
-  onMic: () => play({ mic: true })
+  onMic: () => play({ mic: true }),
+  onExport: exportVideo,
+  onCancelExport: () => {
+    if (exporting) { exporting.cancelled = true; ui.cancelling() }
+  }
 })
+let exporting = null
 
 if (!AudioContext) {
   ui.show('Sorry, your browser does not support the Web Audio API.', true)
@@ -50,7 +55,8 @@ window.addEventListener('resize', () => {
 })
 
 window.addEventListener('keydown', (ev) => {
-  if (ev.target && ev.target.tagName === 'INPUT') return
+  if (ev.target && /INPUT|SELECT/.test(ev.target.tagName)) return
+  if (ui.busy) return
   if (ev.key === 'Escape') {
     ui.show('Drop an audio file anywhere, or choose a source.')
   } else if (ev.key === ' ' && current) {
@@ -93,6 +99,7 @@ function getOptions (base) {
 }
 
 function stop () {
+  ui.setExportable(false)
   loop.stop()
   loop.removeAllListeners('tick')
   if (!current) return
@@ -160,26 +167,15 @@ function start (entry) {
   current = entry
   ui.hide()
   clear()
+  ui.setExportable(entry.audio ? (videoExport.isSupported() ? true : 'unsupported') : false,
+    entry.opt.file ? entry.opt.file.name : null)
 
   const { opt, node, audio } = entry
-  const shape = [0, 0]
-  const camera = createCamera({ fov: Math.PI / 4, near: 0.01, far: 100 })
-  const cursor = [0, 0, 0]
-  let positions = []
+  const spiral = createSpiral(context, opt)
+  const startOffset = audio ? audio.currentTime : 0
   let liveTime = 0
 
-  const positionMax = defined(opt.capacity, 1000)
-  const dist = defined(opt.distance, 0.25)
-  const ySize = defined(opt.extent, 0.5)
-  const alpha = defined(opt.alpha, 0.25)
-  const startOffset = audio ? audio.currentTime : 0
-
-  entry.reset = () => {
-    shape[0] = window.innerWidth
-    shape[1] = window.innerHeight
-    camera.viewport = [0, 0, shape[0], shape[1]]
-    positions = []
-  }
+  entry.reset = () => spiral.resize(window.innerWidth, window.innerHeight, dpr)
   entry.reset()
 
   loop.on('tick', render).start()
@@ -199,44 +195,81 @@ function start (entry) {
   function render (dt) {
     const { time, t } = getProgress(dt)
     if (t > 1) return loop.stop()
-
-    const audioData = node.waveform()
-    const bufferLength = audioData.length
-
-    camera.identity()
-    camera.translate(opt.position || [0, 3.5, 0])
-    camera.lookAt([0, 0, 0])
-    camera.update()
-
-    context.save()
-    context.scale(dpr, dpr)
-    context.strokeStyle = 'rgba(0, 0, 0, ' + alpha + ')'
-    context.lineWidth = 1
-    context.lineJoin = 'round'
-    context.beginPath()
-    for (let i = positions.length - 1; i >= 0; i--) {
-      const pos = positions[i]
-      context.lineTo(pos[0], pos[1])
-    }
-    context.stroke()
-    context.restore()
-
-    const radius = 1 - t
-    const startAngle = time
-    for (let i = 0; i < bufferLength; i++) {
-      const a = i / (bufferLength - 1)
-      const angle = lerp(startAngle + dist, startAngle, a)
-      cursor[0] = Math.cos(angle) * radius
-      cursor[2] = Math.sin(angle) * radius
-
-      const amplitude = audioData[i] / 128.0
-      const waveY = amplitude * ySize / 2
-
-      const [x, y] = camera.project([cursor[0], cursor[1] + waveY, cursor[2]])
-      if (positions.length > positionMax) positions.shift()
-      positions.push([x, y])
-    }
+    spiral.draw(node.waveform(), time, t)
   }
+}
+
+async function exportVideo (settings) {
+  if (!current || !current.audio || exporting) return
+  const { opt } = current
+  const baseName = (opt.file ? opt.file.name.replace(/\.[^.]+$/, '') : 'polartone')
+  const fileName = baseName + '-' + settings.width + 'x' + settings.height + '.mp4'
+
+  // Must happen first, while the click still counts as a user gesture.
+  let writable = null
+  try {
+    writable = await videoExport.pickOutput(fileName)
+  } catch (err) {
+    if (err.name === 'AbortError') return // user closed the save dialog
+  }
+
+  if (!current.audio.paused) togglePause()
+  const job = exporting = { cancelled: false }
+  const preview = document.createElement('canvas')
+  ui.startProgress(preview)
+
+  try {
+    ui.progress(0, 'Decoding audio…')
+    const data = opt.file
+      ? await opt.file.arrayBuffer()
+      : await fetch(opt.url).then((r) => {
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        return r.arrayBuffer()
+      })
+    const audioBuffer = await getAudioContext().decodeAudioData(data)
+
+    const result = await videoExport.render({
+      audioBuffer,
+      preset: opt,
+      width: settings.width,
+      height: settings.height,
+      fps: settings.fps,
+      length: settings.length,
+      canvas: preview,
+      writable,
+      isCancelled: () => job.cancelled,
+      onProgress: (fraction, info) => {
+        if (job.cancelled) return
+        ui.progress(fraction, 'Frame ' + info.frame + ' / ' + info.frameCount +
+          (info.eta > 1 ? ' · about ' + formatTime(info.eta) + ' left' : ''))
+      }
+    })
+
+    exporting = null
+    if (!result) return ui.endProgress('Export cancelled.')
+    if (result.blob) download(result.blob, fileName)
+    ui.endProgress('Saved ' + fileName + (result.hasAudio ? '' : ' (without audio: this browser cannot encode AAC or Opus)') + '.')
+  } catch (err) {
+    exporting = null
+    console.error(err)
+    ui.endProgress('Export failed: ' + (err && err.message ? err.message : err), true)
+  }
+}
+
+function formatTime (sec) {
+  sec = Math.round(sec)
+  const m = Math.floor(sec / 60)
+  return m > 0 ? m + ' min ' + (sec % 60) + ' s' : sec + ' s'
+}
+
+function download (blob, name) {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000)
 }
 
 function togglePause () {
@@ -258,11 +291,7 @@ function togglePause () {
 }
 
 function clear () {
-  context.save()
-  context.setTransform(1, 0, 0, 1, 0, 0)
-  context.fillStyle = '#fff'
-  context.fillRect(0, 0, canvas.width, canvas.height)
-  context.restore()
+  createSpiral.clear(context)
 }
 
 function savePNG () {
